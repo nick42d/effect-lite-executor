@@ -1,24 +1,59 @@
-use effect_light::{Effect, EffectAsync, EffectExt};
-use futures::Stream;
+#![no_std]
 
-type NoDepsEffect<T> = dyn Stream<Item = T>;
+use core::{ops::DerefMut, task::Poll};
 
-struct Executor<T> {
+use futures::StreamExt;
+use smallbox::{smallbox, SmallBox};
+
+type NoDepsEffect<T> = dyn futures::Stream<Item = T>;
+type SmallboxSize = smallbox::space::S8;
+
+struct Executor<T, const N: usize> {
     next_task_id: u64,
-    task_list: Vec<Box<NoDepsEffect<T>>>,
+    task_list: heapless::Vec<SmallBox<NoDepsEffect<T>, SmallboxSize>, N>,
 }
 
-impl<T> Executor<T> {
-    pub fn push_effect<D>(&mut self, dependency: D, e: impl EffectAsync<D, OutputAsync = T>) {
-        let s = Box::new(
-            e.map_output(|fut| futures::stream::once(fut))
-                .resolve(dependency),
-        ) as Box<NoDepsEffect<T>>;
+impl<T, const N: usize> Executor<T, N> {
+    fn new() -> Self {
+        Self {
+            next_task_id: 0,
+            task_list: heapless::Vec::new(),
+        }
     }
-    pub async fn get_next(&mut self) -> Option<()> {
-        todo!()
+    fn push(&mut self, t: impl futures::Stream<Item = T> + 'static) {
+        self.task_list[0] = smallbox!(t)
+    }
+    fn get_next(&mut self) -> GetNext<T> {
+        GetNext {
+            items: self.task_list.as_mut_slice(),
+        }
     }
 }
+
+struct GetNext<'a, T> {
+    items: &'a mut [SmallBox<NoDepsEffect<T>, SmallboxSize>],
+}
+
+impl<'a, T> futures::Future for GetNext<'a, T> {
+    type Output = Option<T>;
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        for item in self.items.iter_mut() {
+            let item = unsafe { core::pin::Pin::new_unchecked(item.deref_mut()) };
+            match futures::stream::Stream::poll_next(item, cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(t)) => return Poll::Ready(Some(t)),
+                Poll::Pending => (),
+            }
+        }
+        Poll::Pending
+    }
+}
+
+#[cfg(feature = "tokio")]
+mod tokio;
 
 #[cfg(test)]
 mod tests {}
