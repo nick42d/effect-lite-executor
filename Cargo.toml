@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+allocator-api2 = "0.4.0"
 effect-light = { version = "0.2.0", path = "../effect-lite", features = ["futures"] }
 futures = "0.3.32"
 heapless = { version = "0.9.2", features = ["portable-atomic"] }
+pin-project = "1.1.11"
 smallbox = { version = "0.8.8", default-features = false }
 tokio = { version = "1.51.1", features = ["rt"], optional = true }
 
