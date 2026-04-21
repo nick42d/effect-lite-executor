@@ -1,37 +1,40 @@
+//! A concurrent (not parrallel) executor for [effect_light::Effect]s.
+//! The executor is no-std, however an allocator is required.
+//! # Usage example
+//! ```
+//!
+//! ```
 #![no_std]
 
+use allocator_api2::{alloc::Allocator, boxed::Box, vec::Vec};
 use core::{
     any::{Any, TypeId},
     marker::PhantomData,
-    ops::DerefMut,
-    pin::{pin, Pin},
+    pin::Pin,
     task::Poll,
 };
+use effect_light::Effect;
 use futures::StreamExt;
-use pin_project::pin_project;
-use smallbox::{smallbox, SmallBox};
 
 type NoDepsEffect<T> = dyn futures::Stream<Item = T>;
 type SmallboxSize = smallbox::space::S8;
 
-struct Executor<T, const N: usize, A: allocator_api2::alloc::Allocator> {
+struct Executor<E, T, D, A: Allocator, F1> {
     next_task_id: u64,
     last_polled: usize,
-    task_list: heapless::Vec<ExecutorItem<T, A>, N>,
+    task_list: Vec<ExecutorItem<T, A>, A>,
+    on_push_cb: Option<F1>,
+    effect_type: PhantomData<E>,
+    dependencies: D,
 }
 
 struct Enumerated<T>(usize, T);
 
-struct ExecutorItem<T, A: allocator_api2::alloc::Allocator> {
-    stream: allocator_api2::boxed::Box<NoDepsEffect<Enumerated<T>>, A>,
+struct ExecutorItem<T, A: Allocator> {
+    stream: Pin<Box<NoDepsEffect<Enumerated<T>>, A>>,
     task_id: u64,
     task_type_name: &'static str,
     task_type_id: TypeId,
-}
-impl<T, A: allocator_api2::alloc::Allocator> core::fmt::Debug for ExecutorItem<T, A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
-    }
 }
 
 enum EffectOutput<T> {
@@ -49,45 +52,77 @@ enum EffectOutput<T> {
     },
 }
 
-impl<T, const N: usize, A: allocator_api2::alloc::Allocator> Executor<T, N, A> {
-    fn new() -> Self {
+impl<E: effect_light::Effect<T>, T, A: Allocator, D> Executor<E, T, D, A, ()> {
+    fn new(dependencies: D, alloc: A) -> Self {
         Self {
             next_task_id: 0,
-            task_list: heapless::Vec::new(),
+            task_list: Vec::new_in(alloc),
             last_polled: 0,
+            on_push_cb: None,
+            effect_type: PhantomData,
+            dependencies,
         }
     }
-    fn push(&mut self, stream: impl futures::Stream<Item = T> + Any + 'static, alloc: A) {
+    fn push<'a, S>(&'a mut self, effect: E, alloc: A)
+    where
+        A: 'static,
+        E: Effect<&'a mut D, Output = S> + Any,
+        S: futures::Stream<Item = T> + Any + 'static,
+    {
         let task_id = self.next_task_id;
         self.next_task_id += 1;
-        let task_type_name = core::any::type_name_of_val(&stream);
-        let task_type_id = stream.type_id();
-        self.task_list
-            .push(ExecutorItem {
-                stream: allocator_api2::unsize_box!(allocator_api2::boxed::Box::new_in(
-                    stream.enumerate().map(|(idx, item)| Enumerated(idx, item)),
-                    alloc,
-                )),
-                task_id,
-                task_type_name,
-                task_type_id,
-            })
-            .unwrap()
+        let task_type_name = core::any::type_name_of_val(&effect);
+        let task_type_id = effect.type_id();
+        let stream = effect.resolve(&mut self.dependencies);
+        let stream: Box<NoDepsEffect<Enumerated<T>>, A> =
+            allocator_api2::unsize_box!(allocator_api2::boxed::Box::new_in(
+                stream.enumerate().map(|(idx, item)| Enumerated(idx, item)),
+                alloc,
+            ));
+        self.task_list.push(ExecutorItem {
+            stream: Pin::from(stream),
+            task_id,
+            task_type_name,
+            task_type_id,
+        })
     }
-    fn get_next(&mut self) -> GetNext<T, N> {
+    fn get_next(&mut self) -> GetNext<T, A> {
         GetNext {
             items: &mut self.task_list,
+            last_polled: &mut self.last_polled,
         }
     }
 }
 
-#[pin_project]
-struct GetNext<'a, T, const N: usize> {
-    #[pin]
-    items: &'a mut heapless::Vec<ExecutorItem<T>, N>,
+impl<E: effect_light::Effect<T>, T, D, A: Allocator, F1> Executor<E, T, D, A, F1> {
+    fn with_on_push_cb<F>(self, cb: F) -> Executor<E, T, D, A, F>
+    where
+        F: FnMut(E),
+    {
+        let Self {
+            next_task_id,
+            last_polled,
+            task_list,
+            on_push_cb: _,
+            effect_type,
+            dependencies,
+        } = self;
+        Executor {
+            next_task_id,
+            last_polled,
+            task_list,
+            on_push_cb: Some(cb),
+            effect_type,
+            dependencies,
+        }
+    }
+}
+struct GetNext<'a, T, A: Allocator> {
+    items: &'a mut Vec<ExecutorItem<T, A>, A>,
+    last_polled: &'a mut usize,
 }
 
-impl<'a, T, const N: usize> futures::Future for GetNext<'a, T, N> {
+impl<'a, T, A: Allocator> futures::Future for GetNext<'a, T, A> {
     type Output = Option<EffectOutput<T>>;
     fn poll(
         mut self: core::pin::Pin<&mut Self>,
@@ -95,10 +130,16 @@ impl<'a, T, const N: usize> futures::Future for GetNext<'a, T, N> {
     ) -> Poll<Self::Output> {
         let len = self.items.len();
         for idx in 0..len {
-            // NOPANIC: len checked above
-            let stream =
-                unsafe { core::pin::Pin::new_unchecked(self.items[idx].stream.deref_mut()) };
-            match futures::stream::Stream::poll_next(stream, cx) {
+            // TODO: Tests for poll order
+            *self.last_polled += 1;
+            let adj_idx = (idx + *self.last_polled) % len;
+            let mut stream = self
+                .items
+                .get_mut(adj_idx)
+                .expect("adj_idx should be within bounds since it's modulod with len")
+                .stream
+                .as_mut();
+            match futures::stream::Stream::poll_next(stream.as_mut(), cx) {
                 Poll::Ready(Option::None) => {
                     // NOPANIC: len checked above
                     let task_id = self.items[idx].task_id;
