@@ -1,4 +1,4 @@
-//! A concurrent (not parrallel) executor for [effect_light::Effect]s.
+//! A concurrent (not parrallel) round-robin executor for [effect_light::Effect]s.
 //! The executor is no-std, however an allocator is required.
 //! # Usage example
 //! ```
